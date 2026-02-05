@@ -23,6 +23,7 @@ from typing import (
 )
 
 from loguru import logger
+import requests
 
 from pipecat.frames.frames import (
     AggregatedTextFrame,
@@ -656,6 +657,79 @@ class TTSService(AIService):
                 if has_started:
                     await self.push_frame(TTSStoppedFrame())
                     has_started = False
+
+    def get_stt_audios(self, type: str):
+        print("into get_stt_audios")
+        if type == "elevenlabs":
+            return self.get_stt_audios_from_elevenlabs()
+        elif type == "resemble":
+            print("into resemble")
+            return self.get_stt_audios_from_resemble()
+
+    
+    def get_stt_audios_from_resemble(self):
+        url = "https://app.resemble.ai/api/v2/voices"
+        headers = {
+        "Authorization": "Token n7hH11uD55QQAouKr9nnQgtt",
+        "Content-Type": "application/json"
+        }
+
+        params = {
+            "page": 1,
+            "page_size": 10
+        }
+
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+
+        result = {
+            "voices": [
+                {
+                    "id": v.get("uuid"),
+                    "name": v.get("name"),
+                    "default_language": v.get("default_language"),
+                    "voice_type": v.get("voice_type"),
+                }
+                for v in response.json()["items"]
+            ]
+        }
+
+        return result
+            
+
+    def get_stt_audios_from_elevenlabs(self):
+        url = "https://api.elevenlabs.io/v1/voices"
+
+        headers = {
+                "xi-api-key": "sk_9f4462e5bd5bcc3d5821b69b5e0f38a60e4abd7f29f2b316",
+            }
+
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+
+        data = response.json()["voices"]
+
+        result = {
+        "voices": [
+                {
+                "voice_id": v.get("voice_id"),
+                "name": v.get("name"),
+                "category": v.get("category"),
+                "description": v.get("description"),
+                "preview_url": v.get("preview_url"),
+                "language": v.get("language"),
+                "accent": v.get("accent"),
+                "gender": v.get("gender"),
+                "preview_url": v.get("preview_url"),
+                "preview_url": v.get("preview_url"),
+                }
+                for v in data
+                ]
+            }
+            
+        return result
+
+
 
 
 class WordTTSService(TTSService):

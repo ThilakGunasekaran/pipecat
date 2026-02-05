@@ -190,6 +190,8 @@ async def parse_telephony_websocket(websocket: WebSocket):
                 "body": body_data,
             }
 
+            print(f"Call data ========================== {call_data}")
+
         elif transport_type == "telnyx":
             call_data = {
                 "stream_id": call_data_raw.get("stream_id"),

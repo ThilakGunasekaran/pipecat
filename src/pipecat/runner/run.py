@@ -80,12 +80,25 @@ import aiohttp
 from fastapi.responses import FileResponse, Response
 from loguru import logger
 
-from pipecat.runner.types import (
+# When run as a script (e.g. python run.py), re-execute as module so relative imports work.
+# Skip when already running as module (python -m pipecat.runner.run) to avoid infinite loop.
+if __name__ == "__main__" and (__package__ or "").strip() != "pipecat.runner":
+    import subprocess
+    _src_dir = Path(__file__).resolve().parent.parent.parent  # pipecatfork/src
+    sys.exit(
+        subprocess.call(
+            [sys.executable, "-m", "pipecat.runner.run"] + sys.argv[1:],
+            cwd=str(_src_dir),
+        )
+    )
+
+from .types import (
     DailyRunnerArguments,
     RunnerArguments,
     SmallWebRTCRunnerArguments,
     WebSocketRunnerArguments,
 )
+
 
 try:
     import uvicorn
@@ -112,7 +125,7 @@ RUNNER_PORT: int = 7860
 
 
 def _get_bot_module():
-    """Get the bot module from the calling script."""
+    """Get the bot module from the calling script or from the workspace containing this runner."""
     import importlib.util
 
     # Get the main module (the file that was executed)
@@ -148,18 +161,111 @@ def _get_bot_module():
             except Exception:
                 continue
 
+    def _try_workspace_bot(workspace_root: Path):
+        """Try to load bot from workspace_root (core/bot.py or bot.py). Returns module if found, else None."""
+        if not workspace_root.is_dir() or not (workspace_root / "core").is_dir():
+            return None
+        _workspace_str = str(workspace_root)
+        if _workspace_str not in sys.path:
+            sys.path.insert(0, _workspace_str)
+        try:
+            import core.bot as core_bot  # type: ignore[import-untyped]
+            if hasattr(core_bot, "bot"):
+                return core_bot
+        except ImportError:
+            pass
+        _core_bot_py = workspace_root / "core" / "bot.py"
+        if _core_bot_py.is_file():
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    "core.bot", _core_bot_py, submodule_search_locations=[str(workspace_root / "core")]
+                )
+                if spec and spec.loader:
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    if hasattr(module, "bot"):
+                        return module
+            except Exception:
+                pass
+        _bot_py = workspace_root / "bot.py"
+        if _bot_py.is_file():
+            try:
+                spec = importlib.util.spec_from_file_location("bot", _bot_py)
+                if spec and spec.loader:
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    if hasattr(module, "bot"):
+                        return module
+            except Exception:
+                pass
+        return None
+
+    # When runner is started from pipecat path (e.g. python pipecatfork/.../run.py),
+    # cwd may be pipecatfork/src; look for bot in workspace root (directory containing
+    # pipecatfork), e.g. Tone/core/bot.py
+    try:
+        _runner_file = Path(__file__).resolve()
+        # run.py -> runner -> pipecat -> src -> pipecatfork -> workspace root (Tone)
+        _src_dir = _runner_file.parent.parent.parent  # pipecatfork/src
+        _pipecatfork_dir = _src_dir.parent  # pipecatfork
+        _workspace_root = _pipecatfork_dir.parent  # directory containing pipecatfork (Tone)
+        module = _try_workspace_bot(_workspace_root)
+        if module is not None:
+            return module
+        # Fallback: cwd may be pipecatfork/src when run via -m pipecat.runner.run; workspace = cwd.parent.parent (Tone)
+        _cwd = Path(os.getcwd()).resolve()
+        if _cwd.name == "src" and (_cwd.parent.parent / "core").is_dir():
+            module = _try_workspace_bot(_cwd.parent.parent)
+            if module is not None:
+                return module
+        if (_cwd / "core").is_dir():
+            module = _try_workspace_bot(_cwd)
+            if module is not None:
+                return module
+    except Exception:
+        pass
+
     raise ImportError(
         "Could not find 'bot' function. Make sure your bot file has a 'bot' function."
     )
 
 
 async def _run_telephony_bot(websocket: WebSocket):
-    """Run a bot for telephony transports."""
+    """Run a bot for telephony transports.
+
+    Resolves the bot (agent) by the phone number the call came to, using
+    core.services.bot_runner_service, then invokes the bot with pre-parsed
+    call_data and agent in runner_args.body. If the service is unavailable,
+    falls back to calling the bot directly (bot will parse the websocket).
+    """
     bot_module = _get_bot_module()
 
-    # Just pass the WebSocket - let the bot handle parsing
-    runner_args = WebSocketRunnerArguments(websocket=websocket)
+    try:
+        from core.database.session import get_db_context
+        from core.services.bot_runner_service import BotRunnerService
+    except ImportError:
+        get_db_context = None
+        BotRunnerService = None
 
+    body = {}
+    if get_db_context is not None and BotRunnerService is not None:
+        try:
+            with get_db_context() as db:
+                agent, transport_type, call_data = await BotRunnerService(
+                    db
+                ).get_bot_for_incoming_call(websocket)
+            body = {
+                "call_data": call_data,
+                "transport_type": transport_type,
+                "agent_id": agent.id if agent else None,
+                "agent": agent,
+            }
+        except Exception as e:
+            logger.warning(
+                "Bot runner service failed, calling bot without pre-parsed data: %s", e
+            )
+
+    runner_args = WebSocketRunnerArguments(websocket=websocket, body=body)
     await bot_module.bot(runner_args)
 
 
@@ -185,16 +291,11 @@ def _create_server_app(
     )
 
     # Set up transport-specific routes
-    if transport_type == "webrtc":
-        _setup_webrtc_routes(app, esp32_mode=esp32_mode, host=host, folder=folder)
-        if whatsapp_enabled:
-            _setup_whatsapp_routes(app)
-    elif transport_type == "daily":
-        _setup_daily_routes(app, dialin_enabled=dialin_enabled)
-    elif transport_type in TELEPHONY_TRANSPORTS:
-        _setup_telephony_routes(app, transport_type=transport_type, proxy=proxy)
-    else:
-        logger.warning(f"Unknown transport type: {transport_type}")
+    _setup_webrtc_routes(app, esp32_mode=esp32_mode, host=host, folder=folder)
+    # _setup_whatsapp_routes(app)
+    _setup_daily_routes(app, dialin_enabled=dialin_enabled)
+    _setup_telephony_routes(app, transport_type=transport_type, proxy=proxy)
+
 
     return app
 
@@ -795,6 +896,7 @@ def _setup_telephony_routes(app: FastAPI, *, transport_type: str, proxy: str):
         """Handle WebSocket connections for telephony."""
         await websocket.accept()
         logger.debug("WebSocket connection accepted")
+        print("Websocket ===========", websocket)
         await _run_telephony_bot(websocket)
 
     @app.get("/")
