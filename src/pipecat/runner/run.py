@@ -896,7 +896,6 @@ def _setup_telephony_routes(app: FastAPI, *, transport_type: str, proxy: str):
         """Handle WebSocket connections for telephony."""
         await websocket.accept()
         logger.debug("WebSocket connection accepted")
-        print("Websocket ===========", websocket)
         await _run_telephony_bot(websocket)
 
     @app.get("/")
