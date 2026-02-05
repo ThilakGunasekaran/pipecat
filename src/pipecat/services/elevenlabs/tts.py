@@ -751,7 +751,7 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
         url = "https://api.elevenlabs.io/v1/voices"
 
         headers = {
-                "xi-api-key": "sk_9f4462e5bd5bcc3d5821b69b5e0f38a60e4abd7f29f2b316",
+                "xi-api-key": self._api_key,
             }
 
         response = requests.get(url, headers=headers)
